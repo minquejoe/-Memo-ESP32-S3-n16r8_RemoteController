@@ -146,7 +146,7 @@ typedef struct
 {
   byte pin;
   byte filter_order;
-  byte filter_threshold;
+  // byte filter_threshold;
   volatile u32_t filtered_val;
   volatile u8_t filtered_val_norm100;
   byte update_interval;
@@ -159,40 +159,62 @@ void ana_filter(void *pt)
 {
   ANA_SET *ana_set = (ANA_SET *)pt;
   // 给摇杆的模拟量的限幅平均滤波
+  // 限幅效果不好，不限幅了
   byte pin = ana_set->pin;
   byte filter_order = ana_set->filter_order;
-  byte filter_threshold = ana_set->filter_threshold;
+  // byte filter_threshold = ana_set->filter_threshold;
   byte update_interval = ana_set->update_interval;
   volatile u32_t *filtered_val = &ana_set->filtered_val;
   volatile u8_t *filtered_val_norm100 = &ana_set->filtered_val_norm100;
-  u16_t ana_max = ana_set->ana_max;
+  // u16_t ana_max = ana_set->ana_max;
   u16_t ana_min = ana_set->ana_min;
 
   pinMode(pin, INPUT);
 
-  u32_t ana_buffer[filter_order] = {analogRead(pin)};
+  // u32_t ana_buffer[filter_order] = {analogRead(pin)};
+  u32_t ana_buffer[filter_order];
   byte buffer_idx = 0;
+  u16_t ana_max;
+
+  // 自动设置 ana_max
+  delay(500); // 等开机完成
+  for (u8_t i; i < filter_order; i++)
+  {
+    ana_buffer[i] = analogRead(pin);
+    delay(1);
+  }
+  for (u32_t val : ana_buffer)
+    *filtered_val = *filtered_val + val;
+  *filtered_val = round(*filtered_val / filter_order);
+  ana_max = 2 * *filtered_val - ana_min;
+
   for (;;)
   {
     ana_buffer[buffer_idx] = analogRead(pin);
-    if (abs((int)(ana_buffer[buffer_idx] - ana_buffer[(buffer_idx + filter_order - 1) % filter_order])) > filter_threshold)
+    // if (abs((int)(ana_buffer[buffer_idx] - ana_buffer[(buffer_idx + filter_order - 1) % filter_order])) > filter_threshold)
+    // {
+    if (xSemaphoreTake(xMutex_flag_anaUpdate, update_interval) == pdPASS)
     {
-      if (xSemaphoreTake(xMutex_flag_anaUpdate, update_interval) == pdPASS)
+      for (u32_t val : ana_buffer)
+        *filtered_val = *filtered_val + val;
+      *filtered_val = round(*filtered_val / filter_order);
+      *filtered_val_norm100 = round(100 * (*filtered_val - ana_min) / (ana_max - ana_min));
+      // 直接限幅
+      if (*filtered_val_norm100 > 110)
       {
-        for (u32_t val : ana_buffer)
-        {
-          *filtered_val = *filtered_val + val;
-        }
-        *filtered_val = round(*filtered_val / filter_order);
-        *filtered_val_norm100 = round(100 * (*filtered_val - ana_min) / (ana_max - ana_min));
-        // 直接限幅
-        if (*filtered_val_norm100 > 100)
-          *filtered_val_norm100 = 100;
-
-        xSemaphoreGive(xMutex_flag_anaUpdate);
+        // ana_min 没设置好的变量溢出
+        *filtered_val_norm100 = 0;
       }
-      buffer_idx = (buffer_idx + 1) % filter_order;
+      else if (*filtered_val_norm100 > 100)
+      {
+        // ana_max 没设置好的大变量值
+        *filtered_val_norm100 = 100;
+      }
+
+      xSemaphoreGive(xMutex_flag_anaUpdate);
     }
+    buffer_idx = (buffer_idx + 1) % filter_order;
+    // }
 
     vTaskDelay(update_interval);
   }
@@ -365,13 +387,16 @@ void setup()
   // 摇杆
   xMutex_flag_anaUpdate = xSemaphoreCreateMutex();
 
-  stick_x.filter_order = 4;
-  stick_x.filter_threshold = 4;
+  // 平均阶数，影响 ana_max
+  stick_x.filter_order = 128;
+  // 阈值太大，导致大幅的变动影响更显著，小幅变动平均效果变差
+  // stick_x.filter_threshold = 0;
   stick_x.pin = 17;
   stick_x.update_interval = 1; // ms
   // ADC 默认12位分辨率 0 - 4095
-  stick_x.ana_max = 4095 + 1250;
-  stick_x.ana_min = 0;
+  // 直接初始化时候计算了
+  // stick_x.ana_max = 4095 + 1245;
+  stick_x.ana_min = 0 + 100;
   if (xTaskCreatePinnedToCore(ana_filter, "DO X", 1024 * 8, (void *)&stick_x, 1, NULL, 1) == pdPASS)
     Serial.println("ANA X task created!");
 
@@ -394,7 +419,16 @@ void setup()
 
 // -----------------------------------
 // Main event loop
-// -----------------------------------z
+// -----------------------------------
+typedef struct
+{
+  u8_t x;
+  u8_t y;
+
+} POINT_POS;
+POINT_POS pos_old = {50, 50};
+POINT_POS pos_new;
+
 void loop()
 {
 
@@ -477,20 +511,28 @@ void loop()
   gslc_ElemXRampSetVal(&m_gui, m_pElem_power, power);
   // gslc_ElemXRadialSetVal(&m_gui, m_pElem_north, power_count % 360 + 1);
 
-  // 动点底盘
-  gslc_DrawFillRoundRect(&m_gui, (gslc_tsRect){(int16_t)(30), (int16_t)(70), 140, 140}, 10, GSLC_COL_BLUE);
-
-  // 动点
-
   if (xSemaphoreTake(xMutex_flag_anaUpdate, 0) == pdPASS)
   {
+    pos_new.x = round(120 / 100 * stick_x.filtered_val_norm100);
+    pos_new.y = round(120 / 100 * stick_y.filtered_val_norm100);
+    xSemaphoreGive(xMutex_flag_anaUpdate);
+  }
+
+  if ((pos_new.x != pos_old.x) || (pos_new.y != pos_old.y))
+  {
+    // 动点底盘
+    gslc_DrawFillRoundRect(&m_gui, (gslc_tsRect){(int16_t)(30), (int16_t)(70), 140, 140}, 10, GSLC_COL_BLUE);
+
+    // 动点
     gslc_DrawFillCircle(&m_gui,
-                        50 + round(120 / 100 * stick_x.filtered_val_norm100),
+                        50 + pos_new.x,
                         // 屏幕翻转了，使用 -
-                        190 - round(120 / 100 * stick_y.filtered_val_norm100),
+                        190 - pos_new.y,
                         5,
                         GSLC_COL_RED);
-    xSemaphoreGive(xMutex_flag_anaUpdate);
+
+    pos_old.x = pos_new.x;
+    pos_old.y = pos_new.y;
   }
 
   // 动点底盘三角 左 右 上 下
@@ -501,11 +543,17 @@ void loop()
 
   // 蓝牙连接指示
   if (deviceConnected)
+  {
     snprintf(acTxt, 4, (char *)"ON!");
+    gslc_ElemSetTxtCol(&m_gui, m_pElem_conn, GSLC_COL_WHITE);
+  }
   else
+  {
     snprintf(acTxt, 4, (char *)"OFF");
+    gslc_ElemSetTxtCol(&m_gui, m_pElem_conn, GSLC_COL_YELLOW);
+  }
   gslc_ElemSetTxtStr(&m_gui, m_pElem_conn, acTxt);
-
+  
   // ------------------------------------------------
   // Periodically call GUIslice update function
   // ------------------------------------------------
